@@ -216,8 +216,7 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
             logW("AES P2: ${e.message}"); rawP2
         }
 
-        // 0xBC frames: raw bytes (no MAC-XOR), per decompiled Huawei app
-        val data = concat(decP1, decP2)  // 0xBC frames: no MAC-XOR
+        val data = macXor(concat(decP1, decP2))
         logD("Decrypted (${data.size}b): ${hex(data, 0, min(data.size, 20))}…")
 
         when (type) {
