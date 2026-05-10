@@ -85,8 +85,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
     // --- Crypto constants -----------------------------------------------------
 
-    private val AES_KEY = hexToBytes("41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50")
-    private val AES_IV  = hexToBytes("51 52 53 54 55 56 57 58 59 5A 61 62 63 64 65 66")
+    private val AES_KEY = hexToBytes("3D A2 78 4A FB 87 B1 2A 98 0F DE 34 56 73 21 56")
+    private val AES_IV  = hexToBytes("4E F7 64 32 2F DA 76 32 12 3D EB 87 90 FE A2 19")
 
     // --- Session state --------------------------------------------------------
 
@@ -209,8 +209,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
             logW("AES P2: ${e.message}"); rawP2
         }
 
-        // MAC-XOR deobfuscate each part, then concatenate
-        val data = concat(macXor(decP1), macXor(decP2))
+        // 0xBC frames: raw bytes (no MAC-XOR), per decompiled Huawei app
+        val data = concat(decP1, decP2)  // 0xBC frames: no MAC-XOR
         logD("Decrypted (${data.size}b): ${hex(data, 0, min(data.size, 20))}…")
 
         when (type) {
