@@ -85,8 +85,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
     // --- Crypto constants -----------------------------------------------------
 
-    private val AES_KEY = hexToBytes("3D A2 78 4A FB 87 B1 2A 98 0F DE 34 56 73 21 56")
-    private val AES_IV  = hexToBytes("4E F7 64 32 2F DA 76 32 12 3D EB 87 90 FE A2 19")
+    private val AES_KEY = hexToBytes("41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50")
+    private val AES_IV  = hexToBytes("51 52 53 54 55 56 57 58 59 5A 61 62 63 64 65 66")
 
     // --- Session state --------------------------------------------------------
 
