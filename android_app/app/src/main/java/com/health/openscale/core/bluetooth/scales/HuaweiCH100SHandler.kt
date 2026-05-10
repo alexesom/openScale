@@ -91,6 +91,7 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     // --- Session state --------------------------------------------------------
 
     private var authCode: ByteArray = ByteArray(0)
+    private var magicKey: ByteArray? = null
     private var triesAuth = 0
     private var authorised = false
     private var userInfoRetries = 0
@@ -146,12 +147,18 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
         when (op) {
             OP_WAKEUP -> {
-                if (!authorised) sendPlain(CMD_AUTH, authCode)
+                if (!authorised) {
+                    magicKey = concat(macXor(authCode), AES_KEY.copyOfRange(7, AES_KEY.size))
+                    sendPlain(CMD_AUTH, authCode)
+                }
             }
 
             OP_AUTH_RESULT -> {
                 if (payload.isNotEmpty() && payload[0].toInt() == 1) {
                     authorised = true
+                    val obfAuth = macXor(authCode)
+                    val keyTail = AES_KEY.copyOfRange(7, AES_KEY.size)
+                    magicKey = concat(obfAuth, keyTail)
                     sendPlain(CMD_SET_UNIT, byteArrayOf(0x01))
                     sendSetTime()
                     sendUserInfo(user, lastWeightTenthKg.takeIf { it > 0 })
@@ -201,11 +208,11 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
         val rawP1 = first.copyOfRange(3, first.size)
         val rawP2 = second.copyOfRange(3, second.size)
 
-        // AES-CTR decrypt each 16-byte part separately (IV resets per part, initial key)
-        val decP1 = try { aesCtr(rawP1) } catch (e: GeneralSecurityException) {
+        val key = magicKey ?: AES_KEY
+        val decP1 = try { aesCtr(rawP1, key) } catch (e: GeneralSecurityException) {
             logW("AES P1: ${e.message}"); rawP1
         }
-        val decP2 = try { aesCtr(rawP2) } catch (e: GeneralSecurityException) {
+        val decP2 = try { aesCtr(rawP2, key) } catch (e: GeneralSecurityException) {
             logW("AES P2: ${e.message}"); rawP2
         }
 
@@ -330,7 +337,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
     private fun sendEncrypted(cmd: Byte, payload: ByteArray) {
         val obfuscated = macXor(payload)
-        val enc = try { aesCtr(obfuscated) } catch (e: GeneralSecurityException) {
+        val key = magicKey ?: AES_KEY
+        val enc = try { aesCtr(obfuscated, key) } catch (e: GeneralSecurityException) {
             logW("AES encrypt: ${e.message}"); return
         }
         val header = byteArrayOf(0xDC.toByte(), payload.size.toByte(), cmd)
@@ -347,9 +355,9 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
         return out
     }
 
-    private fun aesCtr(data: ByteArray): ByteArray {
+    private fun aesCtr(data: ByteArray, key: ByteArray = AES_KEY): ByteArray {
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(AES_KEY, "AES"), IvParameterSpec(AES_IV))
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(AES_IV))
         return cipher.doFinal(data)
     }
 
