@@ -38,6 +38,10 @@ android {
         manifestPlaceholders["appRoundIcon"] = "@mipmap/ic_launcher_round"
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     signingConfigs {
         create("release") {
             val keystorePropertiesFile = rootProject.file("../../openScale.keystore")
@@ -99,6 +103,7 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            manifestPlaceholders["appName"] = "openScale debug"
             manifestPlaceholders["appIcon"] = "@mipmap/ic_launcher_dev"
             manifestPlaceholders["appRoundIcon"] = "@mipmap/ic_launcher_dev_round"
         }

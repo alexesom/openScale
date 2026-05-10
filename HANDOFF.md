@@ -23,8 +23,8 @@ The core problem is still protocol correctness: openScale's CH100S handling has 
 Repository state as of 2026-05-10:
 
 - Repo path: `/Users/alex/experimenting/openScale`
-- Worktree status: clean
-- Current `HEAD`: `e8ebe094`
+- Worktree status: final AH100/CH100 fix validated on test phone
+- Base before final field fix: `e8ebe094`
 - Latest commits:
   - `e8ebe094` Fix MAC-XOR application in CH100S - apply to concatenated result
   - `3c8ae7dc` Derive magicKey in CH100S handler - match Huawei app key derivation
@@ -35,8 +35,18 @@ Repository state as of 2026-05-10:
 
 Latest build status:
 
-- Latest installed build corresponding to this line of work: commit `e8ebe094`
-- This exact build was described as installed but not yet validated against a fresh real measurement
+- Latest validated debug build corresponding to this line of work was installed at `2026-05-10 09:04:52`
+- The working protocol follows `AUTH -> GET_VERSION -> SET_UNIT -> CLOCK -> USER_INFO`. The debug app label was made distinct from `com.health.openscale.oss` to avoid testing the wrong app.
+
+Field-test update from the debug app data:
+
+- The real saved device on the test phone is named `CH100`, not `CH100S`.
+- The pre-rebase code selected the retired `HuaweiAH100Handler`, so CH100S protocol fixes were not exercised.
+- The bad saved debug record was produced through that wrong route: timestamp `4804-12-14 16:29`, weight `3915.7 kg`, body fat `4757.1%`.
+- Latest upstream routes `CH100` and `AH100` through `HuaweiAhCh100Handler`; `HuaweiCH100SHandler` remains dedicated to `CH100S` and drops implausible decrypted frames instead of saving garbage.
+- A later successful field test showed correct decoded data. Android/BLE reports advertising name `CH100`, which the upstream combined AH100/CH100 handler now owns.
+- Startup lag was traced to repeated `0x20` list-update/user-changed notifications causing duplicate encrypted `USER_INFO` writes. Latest local fix follows the Huawei app's ACK chain (`AUTH -> GET_VERSION -> SET_UNIT -> CLOCK -> USER_INFO`) and treats `0x20` as `USER_INFO`/list-update ACK, not as another `USER_INFO` request. A heartbeat command `DB 01 20` is sent after ~1.5s idle to avoid GATT `CONNECTION_TIMEOUT` during the silent BIA measurement window.
+- The 2026-05-10 09:03 field report could not be diagnosed from protocol logs because `logcat` contained no `DEBUG-ch100s` lines and the debug package task was not running after the test. The phone has both `com.health.openscale.oss` and `com.health.openscale.debug` installed, both previously labeled `openScale`; assume that run may have used the wrong app until proven otherwise.
 
 ## What was actually fixed
 
@@ -169,7 +179,7 @@ Huawei flow:
 Primary files in this repo:
 
 - [HuaweiCH100SHandler.kt](/Users/alex/experimenting/openScale/android_app/app/src/main/java/com/health/openscale/core/bluetooth/scales/HuaweiCH100SHandler.kt)
-- [HuaweiAH100Handler.kt](/Users/alex/experimenting/openScale/android_app/app/src/main/java/com/health/openscale/core/bluetooth/scales/HuaweiAH100Handler.kt)
+- [HuaweiAhCh100Handler.kt](/Users/alex/experimenting/openScale/android_app/app/src/main/java/com/health/openscale/core/bluetooth/scales/HuaweiAhCh100Handler.kt)
 
 The active path is this repo:
 

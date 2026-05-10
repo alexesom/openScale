@@ -17,6 +17,7 @@
  */
 package com.health.openscale.core.bluetooth.scales
 
+import android.os.SystemClock
 import com.health.openscale.R
 import com.health.openscale.core.bluetooth.data.ScaleMeasurement
 import com.health.openscale.core.bluetooth.data.ScaleUser
@@ -28,6 +29,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.Timer
+import java.util.TimerTask
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -94,7 +97,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     private var magicKey: ByteArray? = null
     private var triesAuth = 0
     private var authorised = false
-    private var userInfoRetries = 0
+    @Volatile private var lastOutboundAtMs = 0L
+    @Volatile private var heartbeatTimer: Timer? = null
     private var lastWeightTenthKg: Int = -1
 
     private var pendingType: Byte = 0x00
@@ -124,6 +128,7 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     private val CMD_GET_RECORD  = 11.toByte()
     private val CMD_GET_VERSION = 12.toByte()
     private val CMD_FAT_ACK     = 19.toByte()
+    private val CMD_HEARTBEAT   = 32.toByte()
     private val CMD_AUTH        = 36.toByte()
     private val CMD_BIND        = 37.toByte()
 
@@ -134,7 +139,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
         setNotifyOn(SERVICE, CHAR_RX)
         triesAuth = 0
         authorised = false
-        userInfoRetries = 0
+        lastOutboundAtMs = 0L
+        stopHeartbeat()
         pendingType = 0x00
         pendingFirst = null
         userInfo(R.string.bt_info_step_on_scale)
@@ -142,6 +148,10 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
     override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
         if (characteristic != CHAR_RX || data.size < 3) return
+        if (data[0] == 0xBD.toByte() && data.size != ((data[1].toInt() and 0xFF) + 3)) {
+            logD("Ignoring malformed CH100S control frame len=${data.size} declared=${data[1].toInt() and 0xFF}")
+            return
+        }
         val op = data[2]
         val payload = macXor(data.copyOfRange(3, data.size))
 
@@ -159,11 +169,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
                     val obfAuth = macXor(authCode)
                     val keyTail = AES_KEY.copyOfRange(7, AES_KEY.size)
                     magicKey = concat(obfAuth, keyTail)
-                    sendPlain(CMD_SET_UNIT, byteArrayOf(0x01))
-                    sendSetTime()
-                    sendUserInfo(user, lastWeightTenthKg.takeIf { it > 0 })
+                    startHeartbeat()
                     sendPlain(CMD_GET_VERSION, byteArrayOf())
-                    userInfoRetries = 0
                     userInfo(R.string.bt_info_step_on_scale)
                 } else {
                     if (triesAuth++ < 2) sendPlain(CMD_AUTH, authCode)
@@ -171,10 +178,14 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
                 }
             }
 
+            OP_VERSION -> sendPlain(CMD_SET_UNIT, byteArrayOf(0x01))
+
+            OP_UNITS_SET -> sendSetTime()
+
+            OP_CLOCK -> sendUserInfo(user, lastWeightTenthKg.takeIf { it > 0 })
+
             OP_USER_CHANGED -> {
-                if (userInfoRetries++ < 5) {
-                    sendUserInfo(user, lastWeightTenthKg.takeIf { it > 0 })
-                }
+                logD("CH100S user info/list update ack")
             }
 
             OP_MEAS_P1, OP_HIST_P1 -> {
@@ -196,7 +207,9 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
             OP_HIST_DONE -> { /* history upload complete */ }
 
-            OP_UNITS_SET, OP_CLOCK, OP_VERSION, OP_SLEEP, OP_BIND_OK -> { /* ack */ }
+            OP_BIND_OK -> { /* ack */ }
+
+            OP_SLEEP -> stopHeartbeat()
 
             else -> logD("Unhandled op 0x%02X".format(op))
         }
@@ -205,8 +218,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     // --- Measurement decryption & parsing ------------------------------------
 
     private fun handleEncryptedPair(first: ByteArray, second: ByteArray, type: Byte) {
-        val rawP1 = first.copyOfRange(3, first.size)
-        val rawP2 = second.copyOfRange(3, second.size)
+        val rawP1 = first.copyOfRange(3, min(first.size, 19))
+        val rawP2 = second.copyOfRange(3, min(second.size, 19))
 
         val key = magicKey ?: AES_KEY
         val decP1 = try { aesCtr(rawP1, key) } catch (e: GeneralSecurityException) {
@@ -255,14 +268,28 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
         val weight    = u16le(data, 1) / 10.0f
         val fat       = u16le(data, 3) / 10.0f
         val impedance = u16le(data, 13)
+        val y = u16le(data, 5)
+        val mo = data[7].toInt() and 0xFF
+        val d = data[8].toInt() and 0xFF
+        val h = data[9].toInt() and 0xFF
+        val mi = data[10].toInt() and 0xFF
+        val s = data[11].toInt() and 0xFF
+
+        if (weight !in 2.0f..350.0f ||
+            fat !in 0.0f..75.0f ||
+            y !in 2020..2099 ||
+            mo !in 1..12 ||
+            d !in 1..31 ||
+            h !in 0..23 ||
+            mi !in 0..59 ||
+            s !in 0..59
+        ) {
+            logW("Dropped implausible CH100S frame: ${frameSummary(data)}")
+            return
+        }
 
         val dt = try {
-            val y = u16le(data, 5); val mo = data[7].toInt() and 0xFF
-            val d = data[8].toInt() and 0xFF; val h = data[9].toInt() and 0xFF
-            val mi = data[10].toInt() and 0xFF; val s = data[11].toInt() and 0xFF
-            if (y in 2020..2099 && mo in 1..12 && d in 1..31) {
-                Calendar.getInstance().apply { set(y, mo - 1, d, h, mi, s) }.time
-            } else Date()
+            Calendar.getInstance().apply { set(y, mo - 1, d, h, mi, s) }.time
         } catch (_: Exception) { Date() }
 
         lastWeightTenthKg = (weight * 10).toInt()
@@ -330,18 +357,47 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     // --- Wire helpers ---------------------------------------------------------
 
     private fun sendPlain(cmd: Byte, payload: ByteArray) {
-        val header = byteArrayOf(0xDB.toByte(), payload.size.toByte(), cmd)
-        writeTo(SERVICE, CHAR_TX, concat(header, macXor(payload)), withResponse = true)
+        val header = byteArrayOf(0xDB.toByte(), (payload.size + 1).toByte(), cmd)
+        val packet = concat(header, macXor(payload))
+        lastOutboundAtMs = SystemClock.elapsedRealtime()
+        writeTo(SERVICE, CHAR_TX, packet, withResponse = true)
     }
 
     private fun sendEncrypted(cmd: Byte, payload: ByteArray) {
         val obfuscated = macXor(payload)
         val key = magicKey ?: AES_KEY
-        val enc = try { aesCtr(obfuscated, key) } catch (e: GeneralSecurityException) {
+        val enc = try { aesCtr(pkcs7Pad(obfuscated), key) } catch (e: GeneralSecurityException) {
             logW("AES encrypt: ${e.message}"); return
         }
         val header = byteArrayOf(0xDC.toByte(), payload.size.toByte(), cmd)
-        writeTo(SERVICE, CHAR_TX, concat(header, enc), withResponse = true)
+        val packet = concat(header, enc)
+        lastOutboundAtMs = SystemClock.elapsedRealtime()
+        writeTo(SERVICE, CHAR_TX, packet, withResponse = true)
+    }
+
+    private fun startHeartbeat() {
+        if (heartbeatTimer != null) return
+        val timer = Timer("HuaweiAH100Heartbeat", true)
+        heartbeatTimer = timer
+        timer.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                if (!authorised) return
+                val idleMs = SystemClock.elapsedRealtime() - lastOutboundAtMs
+                if (idleMs >= HEARTBEAT_IDLE_MS) {
+                    sendPlain(CMD_HEARTBEAT, byteArrayOf())
+                }
+            }
+        }, HEARTBEAT_IDLE_MS, HEARTBEAT_CHECK_MS)
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = null
+    }
+
+    override fun onDisconnected() {
+        stopHeartbeat()
+        authorised = false
     }
 
     // --- Crypto ---------------------------------------------------------------
@@ -358,6 +414,12 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(AES_IV))
         return cipher.doFinal(data)
+    }
+
+    private fun pkcs7Pad(data: ByteArray): ByteArray {
+        val remainder = data.size % 16
+        val pad = if (remainder == 0) 16 else 16 - remainder
+        return data + ByteArray(pad) { pad.toByte() }
     }
 
     // --- Utils ----------------------------------------------------------------
@@ -390,7 +452,22 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
         }
 
     private fun hex(b: ByteArray, off: Int = 0, len: Int = b.size): String =
-        (off until (off + len)).joinToString(" ") { "%02X".format(b[it]) }
+        (off until min(b.size, off + len)).joinToString(" ") { "%02X".format(b[it]) }
+
+    private fun frameSummary(data: ByteArray): String {
+        if (data.size < 15) return "short(${data.size})"
+        return "user=${data[0].toInt() and 0xFF} " +
+            "weight=${u16le(data, 1) / 10.0f} " +
+            "fat=${u16le(data, 3) / 10.0f} " +
+            "date=${u16le(data, 5)}-${data[7].toInt() and 0xFF}-${data[8].toInt() and 0xFF} " +
+            "time=${data[9].toInt() and 0xFF}:${data[10].toInt() and 0xFF}:${data[11].toInt() and 0xFF} " +
+            "imp=${u16le(data, 13)}"
+    }
 
     private fun ts(d: Date) = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(d)
+
+    private companion object {
+        const val HEARTBEAT_IDLE_MS = 1500L
+        const val HEARTBEAT_CHECK_MS = 500L
+    }
 }
