@@ -49,6 +49,11 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.milliseconds
 
+internal fun resolveMeasurementAppUserId(
+    measurement: ScaleMeasurement,
+    currentAppUserId: Int?
+): Int? = measurement.userId.takeIf { it > 0 && it != 0xFF } ?: currentAppUserId
+
 /**
  * Manages Bluetooth connections to scale devices, handling the connection lifecycle,
  * data reception, and error reporting. It interacts with [com.health.openscale.core.bluetooth.ScaleCommunicator] instances
@@ -432,8 +437,8 @@ class BleConnector(
         measurementData: ScaleMeasurement,
         deviceName: String
     ) {
-        val currentAppUserId = getCurrentScaleUser()?.id
-        if (currentAppUserId == 0) {
+        val appUserId = resolveMeasurementAppUserId(measurementData, getCurrentScaleUser()?.id)
+        if (appUserId == null || appUserId == 0) {
             LogManager.e(TAG, "($deviceName): No App User ID to save measurement.")
             _snackbarEvents.tryEmit(
                 SnackbarEvent(
@@ -443,12 +448,12 @@ class BleConnector(
             )
             return
         }
-        LogManager.i(TAG, "($deviceName): Saving measurement for App User ID $currentAppUserId.")
+        LogManager.i(TAG, "($deviceName): Saving measurement for App User ID $appUserId.")
 
         // Perform DB work on IO dispatcher.
         scope.launch(Dispatchers.IO) {
             val newDbMeasurement = Measurement(
-                userId = currentAppUserId ?: 0,
+                userId = appUserId,
                 timestamp = measurementData.dateTime?.time ?: System.currentTimeMillis()
             )
 
@@ -582,7 +587,7 @@ class BleConnector(
                 val measurementId = measurementFacade.saveMeasurementFromBleDevice(newDbMeasurement, values)
                 LogManager.i(
                     TAG,
-                    "Measurement from $deviceName for User $currentAppUserId saved (ID: $measurementId). Values: ${values.size}"
+                    "Measurement from $deviceName for User $appUserId saved (ID: $measurementId). Values: ${values.size}"
                 )
                 pendingSavedCount.incrementAndGet()
                 lastSavedArgs = listOf(measurementData.weight, deviceName)
