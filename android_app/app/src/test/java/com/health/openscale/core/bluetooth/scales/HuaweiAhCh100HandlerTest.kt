@@ -178,7 +178,7 @@ class HuaweiAhCh100HandlerTest {
     }
 
     @Test
-    fun `buildEncryptedCommand uses payload size as length and AES-CTR encrypts`() {
+    fun `buildEncryptedCommand matches official USER_INFO framing`() {
         val mac = HuaweiAhCh100Handler.macStringToBytes(TEST_MAC)
         val mk = HuaweiAhCh100Handler.hexToBytes(EXPECTED_MAGIC_KEY)
         val payload = hex("1122334455667788")
@@ -191,13 +191,43 @@ class HuaweiAhCh100HandlerTest {
         assertThat(frame[0]).isEqualTo(HuaweiAhCh100Handler.FRAME_ENCRYPTED)
         assertThat(frame[1].toInt() and 0xFF).isEqualTo(payload.size)
         assertThat(frame[2]).isEqualTo(HuaweiAhCh100Handler.CMD_USER_INFO)
-        // Recover plaintext: deobfuscate then AES-CTR.
-        val deobf = HuaweiAhCh100Handler.obfuscate(frame.copyOfRange(3, frame.size), mac)
-        val pt = HuaweiAhCh100Handler.aesCtr(deobf, mk, HuaweiAhCh100Handler.INITIAL_IV)
-        assertThat(pt).isEqualTo(payload)
+        assertThat(frame).hasLength(19)
+        // Official order: MAC-XOR plaintext, PKCS#7-pad, then AES-CTR.
+        val padded = HuaweiAhCh100Handler.aesCtr(
+            frame.copyOfRange(3, frame.size),
+            mk,
+            HuaweiAhCh100Handler.INITIAL_IV
+        )
+        assertThat(HuaweiAhCh100Handler.obfuscate(padded.copyOfRange(0, payload.size), mac))
+            .isEqualTo(payload)
+        assertThat(padded.copyOfRange(payload.size, padded.size)).isEqualTo(ByteArray(8) { 8 })
     }
 
     // -- History lifecycle --------------------------------------------------
+
+    @Test
+    fun `authenticated setup is callback chained through profile update`() {
+        val fixture = Fixture()
+        fixture.handler.handleConnected(fixture.user)
+        fixture.notify("bd0000")
+        fixture.transport.writes.clear()
+
+        fixture.notify("bd01265d")
+        assertThat(fixture.transport.writes.map { it[2] })
+            .containsExactly(HuaweiAhCh100Handler.CMD_GET_VERSION)
+
+        fixture.notify("bd000c")
+        fixture.notify("bd0002")
+        fixture.notify("bd0008")
+        assertThat(fixture.transport.writes.map { it[2] })
+            .containsExactly(
+                HuaweiAhCh100Handler.CMD_GET_VERSION,
+                HuaweiAhCh100Handler.CMD_SET_UNIT,
+                HuaweiAhCh100Handler.CMD_SET_SCALE_CLOCK,
+                HuaweiAhCh100Handler.CMD_USER_INFO
+            ).inOrder()
+        fixture.handler.handleDisconnected()
+    }
 
     @Test
     fun `history capability starts exact user query once after user-info acknowledgement`() {
@@ -205,6 +235,7 @@ class HuaweiAhCh100HandlerTest {
 
         assertThat(fixture.support.implemented).contains(DeviceCapability.HISTORY_READ)
         fixture.authorise()
+        fixture.completeSetup()
         fixture.transport.writes.clear()
 
         fixture.acknowledgeUserInfo()
@@ -260,7 +291,7 @@ class HuaweiAhCh100HandlerTest {
     }
 
     @Test
-    fun `live pair publishes and sends only fat-result ack`() {
+    fun `live pair publishes and acknowledges result`() {
         val fixture = Fixture()
         fixture.authorise()
         fixture.transport.writes.clear()
@@ -269,9 +300,78 @@ class HuaweiAhCh100HandlerTest {
         fixture.notify(HISTORY_FRAME2.replace("bc2090", "bc208e"))
 
         assertThat(fixture.published).hasSize(1)
-        assertThat(fixture.published.single().userId).isEqualTo(fixture.user.id)
+        val measurement = fixture.published.single()
+        assertThat(measurement.userId).isEqualTo(fixture.user.id)
+        assertThat(measurement.water).isGreaterThan(0f)
+        assertThat(measurement.muscle).isGreaterThan(0f)
+        assertThat(measurement.bone).isGreaterThan(0f)
+        assertThat(measurement.bmr).isGreaterThan(0f)
+        assertThat(measurement.visceralFat).isGreaterThan(0f)
         assertThat(fixture.transport.writes).hasSize(1)
         assertThat(fixture.transport.writes.single()).isEqualTo(hex("db02135c"))
+        fixture.handler.handleDisconnected()
+    }
+
+    @Test
+    fun `setup profile uses latest persisted weight for offline matching`() {
+        val fixture = Fixture()
+        fixture.lastMeasurement = ScaleMeasurement().apply {
+            weight = 97f
+            impedance = 540.0
+        }
+        fixture.authorise()
+        fixture.completeSetup()
+
+        val profileUpdate = fixture.transport.writes.single {
+            it[2] == HuaweiAhCh100Handler.CMD_USER_INFO
+        }
+        assertThat(profileUpdate[2]).isEqualTo(HuaweiAhCh100Handler.CMD_USER_INFO)
+        assertThat(profileUpdate[1].toInt() and 0xFF).isEqualTo(14)
+        assertThat(profileUpdate).hasLength(19)
+        val mac = HuaweiAhCh100Handler.macStringToBytes(TEST_MAC)
+        val key = HuaweiAhCh100Handler.deriveMagicKey(
+            HuaweiAhCh100Handler.buildAuthToken(fixture.user.id),
+            mac
+        )
+        val padded = HuaweiAhCh100Handler.aesCtr(
+            profileUpdate.copyOfRange(3, profileUpdate.size),
+            key,
+            HuaweiAhCh100Handler.INITIAL_IV
+        )
+        val profile = HuaweiAhCh100Handler.obfuscate(padded.copyOfRange(0, 14), mac)
+        assertThat(HuaweiAhCh100Handler.u16le(profile, 10)).isEqualTo(970)
+        assertThat(HuaweiAhCh100Handler.u16le(profile, 12)).isEqualTo(540)
+        fixture.handler.handleDisconnected()
+    }
+
+    @Test
+    fun `authorised idle link sends heartbeat`() {
+        val fixture = Fixture()
+        fixture.authorise()
+        fixture.transport.writes.clear()
+
+        Thread.sleep(2_100)
+
+        assertThat(fixture.transport.writes.any { it.contentEquals(hex("db0120")) }).isTrue()
+        fixture.handler.handleDisconnected()
+    }
+
+    @Test
+    fun `sleep keeps heartbeat and wake reauthenticates for the next measurement`() {
+        val fixture = Fixture()
+        fixture.authorise()
+        fixture.notify("bd0001")
+        fixture.transport.writes.clear()
+
+        Thread.sleep(2_100)
+
+        assertThat(fixture.transport.writes.any { it.contentEquals(hex("db0120")) }).isTrue()
+        fixture.transport.writes.clear()
+        fixture.notify("bd0000")
+        assertThat(fixture.transport.writes.any {
+            it[2] == HuaweiAhCh100Handler.CMD_AUTH
+        }).isTrue()
+        fixture.handler.handleDisconnected()
     }
 
     @Test
@@ -303,6 +403,20 @@ class HuaweiAhCh100HandlerTest {
         fixture.handler.handleDisconnected()
         fixture.authoriseAndStartHistory()
         assertThat(fixture.transport.writes.last()).isEqualTo(hex("db070b4de8e04c2e595bca"))
+    }
+
+    @Test
+    fun `history completion rearms the next user query`() {
+        val fixture = Fixture()
+        fixture.authoriseAndStartHistory()
+        fixture.transport.writes.clear()
+
+        fixture.notify("bd0019")
+        fixture.acknowledgeUserInfo()
+
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(hex("db070b4de8e04c2e595bca"))
+        fixture.handler.handleDisconnected()
     }
 
     // -- Measurement decoding ------------------------------------------------
@@ -460,6 +574,7 @@ class HuaweiAhCh100HandlerTest {
 
     private class Fixture {
         val published = mutableListOf<ScaleMeasurement>()
+        var lastMeasurement: ScaleMeasurement? = null
         val user = ScaleUser(
             id = 7,
             birthday = Calendar.getInstance().apply { set(1991, Calendar.JANUARY, 2) }.time,
@@ -501,7 +616,7 @@ class HuaweiAhCh100HandlerTest {
                 data = object : ScaleDeviceHandler.DataProvider {
                     override fun currentUser() = user
                     override fun usersForDevice() = listOf(user)
-                    override fun lastMeasurementFor(userId: Int): ScaleMeasurement? = null
+                    override fun lastMeasurementFor(userId: Int): ScaleMeasurement? = lastMeasurement
                 },
                 scope = CoroutineScope(EmptyCoroutineContext)
             )
@@ -517,8 +632,15 @@ class HuaweiAhCh100HandlerTest {
             handler.handleNotification(CHAR_RX, HuaweiAhCh100Handler.hexToBytes("bd0020"))
         }
 
+        fun completeSetup() {
+            notify("bd000c")
+            notify("bd0002")
+            notify("bd0008")
+        }
+
         fun authoriseAndStartHistory() {
             authorise()
+            completeSetup()
             acknowledgeUserInfo()
         }
 

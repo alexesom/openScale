@@ -20,6 +20,7 @@ package com.health.openscale.core.bluetooth.scales
 import com.health.openscale.R
 import com.health.openscale.core.bluetooth.data.ScaleMeasurement
 import com.health.openscale.core.bluetooth.data.ScaleUser
+import com.health.openscale.core.bluetooth.libs.EtekcityLib
 import com.health.openscale.core.service.ScannedDeviceInfo
 import java.io.ByteArrayOutputStream
 import java.security.GeneralSecurityException
@@ -27,6 +28,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.Timer
+import java.util.TimerTask
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -150,11 +153,14 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
     private var authCode: ByteArray = ByteArray(0)
     private var magicKey: ByteArray? = null
     private var triesAuth = 0
-    private var authorised = false
+    @Volatile private var authorised = false
     private var scaleAwake = false
     private var scaleBound = false
     private var sessionUser: ScaleUser? = null
     private var lastMeasuredWeightTenthKg: Int = -1
+    private var lastMeasuredImpedanceOhm: Int = -1
+    @Volatile private var lastOutboundAtMs = 0L
+    @Volatile private var heartbeatTimer: Timer? = null
 
     // First half of an encrypted measurement, awaiting its 0x8E/0x90 sibling.
     private var pendingFirst: ByteArray? = null
@@ -165,7 +171,19 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
     // --- Lifecycle ---------------------------------------------------------
 
     override fun onConnected(user: ScaleUser) {
+        stopHeartbeat()
         sessionUser = user.copy()
+        val latestMeasurement = lastMeasurementFor(user.id)
+        lastMeasuredWeightTenthKg = latestMeasurement
+            ?.weight
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?.let { (it * 10f).toInt() }
+            ?: -1
+        lastMeasuredImpedanceOhm = latestMeasurement
+            ?.impedance
+            ?.takeIf { it.isFinite() && it in 200.0..1500.0 }
+            ?.toInt()
+            ?: -1
         authCode = buildAuthToken(requireNotNull(sessionUser).id)
         triesAuth = 0
         authorised = false
@@ -182,6 +200,7 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
     }
 
     override fun onDisconnected() {
+        stopHeartbeat()
         authorised = false
         scaleAwake = false
         magicKey = null
@@ -205,16 +224,17 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         when (op) {
             NTFY_WAKEUP -> {
                 scaleAwake = true
-                if (!authorised) sendAuth()
+                startHeartbeat()
+                sendAuth()
             }
 
             NTFY_AUTH_RESULT -> {
                 if (deobfTail.isNotEmpty() && deobfTail[0].toInt() == 1) {
                     authorised = true
+                    triesAuth = 0
                     magicKey = deriveMagicKey(authCode, macBytes())
-                    sendSetUnit()
-                    sendSetTime()
-                    sendUserInfo(requireNotNull(sessionUser), lastMeasuredWeightTenthKg.takeIf { it > 0 })
+                    startHeartbeat()
+                    if (!historyActive) historyRequested = false
                     sendGetVersion()
                     userInfo(R.string.bt_info_step_on_scale)
                 } else {
@@ -233,15 +253,18 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
                 sendAuth()
             }
 
-            NTFY_UNITS_SET,
-            NTFY_SCALE_CLOCK,
-            NTFY_SCALE_VERSION,
-            NTFY_GO_SLEEP -> {
-                // benign acks / state transitions
-            }
+            NTFY_SCALE_VERSION -> sendSetUnit()
+
+            NTFY_UNITS_SET -> sendSetTime()
+
+            NTFY_SCALE_CLOCK ->
+                sendUserInfo(requireNotNull(sessionUser), lastMeasuredWeightTenthKg.takeIf { it > 0 })
+
+            NTFY_GO_SLEEP -> Unit
 
             NTFY_HISTORY_UPLOAD_DONE -> {
                 historyActive = false
+                historyRequested = false
                 if (pendingType == NTFY_HISTORY_RECORD) {
                     pendingFirst = null
                     pendingType = 0x00
@@ -329,17 +352,27 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
             Date()
         }
         lastMeasuredWeightTenthKg = (m.weightKg * 10f).toInt()
+        lastMeasuredImpedanceOhm = m.impedanceOhm.takeIf { it in 200..1500 } ?: -1
 
         val sm = ScaleMeasurement().apply {
             this.userId = user.id
             this.dateTime = timestamp
             this.weight = m.weightKg
             this.fat = m.fatPct
-            // The scale reports impedance but the v2.5.4 reference doesn't
-            // derive water/muscle/bone from it; openScale's existing
-            // StandardImpedanceLib can be wired in later for that.
             if (m.impedanceOhm in 1..3999) {
                 this.impedance = m.impedanceOhm.toDouble()
+                val lib = EtekcityLib(
+                    gender = user.gender,
+                    age = user.age,
+                    weightKg = m.weightKg.toDouble(),
+                    heightM = user.bodyHeight.toDouble() / 100.0,
+                    impedance = m.impedanceOhm.toDouble()
+                )
+                this.water = lib.water.toFloat()
+                this.muscle = lib.skeletalMusclePercentage.toFloat()
+                this.bone = lib.boneMass.toFloat()
+                this.bmr = lib.basalMetabolicRate.toFloat()
+                this.visceralFat = lib.visceralFat.toFloat()
             }
         }
         publish(sm)
@@ -382,21 +415,18 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
     }
 
     private fun sendUserInfo(user: ScaleUser, weightTenthKg: Int?) {
-        // Encrypted USER_INFO payload format (matches v2.5.4 exactly):
+        // Official APK USER_INFO payload:
         //   auth(7) || age|sexBit(1) || height(1) || 0x00(1) || weightLE(2)
-        //          || resistanceLE(2) || 0x1C 0xE2 (2 constant)
+        //          || resistanceLE(2)
         // Total = 14 bytes.
         val sexBit = if (user.gender.isMale()) 0x00 else 0x80
-        val age = (user.age and 0xFF) or sexBit
+        val age = (user.age and 0x7F) or sexBit
         val height = user.bodyHeight.toInt() and 0xFF
         val w = (weightTenthKg ?: (user.initialWeight * 10f).toInt()).coerceAtLeast(0)
         val tail = ByteArrayOutputStream().apply {
             write(byteArrayOf(age.toByte(), height.toByte(), 0x00))
             write(le16(w))
-            // Resistance "unknown" sentinel; the scale measures and ignores
-            // whatever we pass here.
-            write(byteArrayOf(0xFF.toByte(), 0xFF.toByte()))
-            write(byteArrayOf(0x1C.toByte(), 0xE2.toByte()))
+            write(le16(lastMeasuredImpedanceOhm.takeIf { it in 200..1500 } ?: 0xFFFF))
         }.toByteArray()
 
         val full = authCode + tail
@@ -411,7 +441,7 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         val chk = xorChecksum(authCode)
         val pl = authCode + byteArrayOf(chk)
         val frame = buildPlainCommand(CMD_GET_RECORD, pl, macBytes(), explicitLen = 0x07)
-        writeTo(SERVICE, CHAR_TX, frame, withResponse = true)
+        writeFrame(frame)
     }
 
     private fun sendGetHistoryNext() {
@@ -424,7 +454,7 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
     private fun sendCmd(cmd: Byte, payload: ByteArray) {
         val frame = buildPlainCommand(cmd, payload, macBytes())
         logD("→ CMD 0x%02X len=%d (plain)".format(cmd.toInt() and 0xFF, payload.size))
-        writeTo(SERVICE, CHAR_TX, frame, withResponse = true)
+        writeFrame(frame)
     }
 
     /** Send an AES-CTR encrypted command (USER_INFO). */
@@ -435,7 +465,31 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         }
         val frame = buildEncryptedCommand(CMD_USER_INFO, payload, mk, macBytes())
         logD("→ CMD* 0x%02X len=%d (encrypted)".format(CMD_USER_INFO.toInt() and 0xFF, payload.size))
+        writeFrame(frame)
+    }
+
+    private fun writeFrame(frame: ByteArray) {
+        lastOutboundAtMs = System.nanoTime() / 1_000_000
         writeTo(SERVICE, CHAR_TX, frame, withResponse = true)
+    }
+
+    private fun startHeartbeat() {
+        if (heartbeatTimer != null) return
+        val timer = Timer("HuaweiAH100Heartbeat", true)
+        heartbeatTimer = timer
+        timer.scheduleAtFixedRate(object : TimerTask() {
+            override fun run() {
+                val idleMs = System.nanoTime() / 1_000_000 - lastOutboundAtMs
+                if (authorised && idleMs >= HEARTBEAT_IDLE_MS) {
+                    sendCmd(CMD_HEARTBEAT, byteArrayOf())
+                }
+            }
+        }, HEARTBEAT_IDLE_MS, HEARTBEAT_CHECK_MS)
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = null
     }
 
     // --- Misc helpers ------------------------------------------------------
@@ -592,8 +646,12 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         const val CMD_GET_RECORD: Byte = 11
         const val CMD_GET_VERSION: Byte = 12
         const val CMD_FAT_RESULT_ACK: Byte = 19
+        const val CMD_HEARTBEAT: Byte = 32
         const val CMD_AUTH: Byte = 36
         const val CMD_BIND_USER: Byte = 37
+
+        private const val HEARTBEAT_IDLE_MS = 1_500L
+        private const val HEARTBEAT_CHECK_MS = 500L
 
         // ---------- Primitives -----------------------------------------------
 
@@ -684,8 +742,8 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
          * Build a host->scale AES-encrypted command frame (start byte
          * [FRAME_ENCRYPTED]).
          *
-         * Length byte equals plaintext payload size (matches v2.5.4's
-         * `lengthByte = payload.size + 0`).
+         * The official app MAC-XORs the plaintext, applies PKCS#7 padding,
+         * then encrypts it. The length byte remains the unpadded payload size.
          */
         fun buildEncryptedCommand(
             cmd: Byte,
@@ -694,9 +752,14 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
             mac: ByteArray,
             iv: ByteArray = INITIAL_IV
         ): ByteArray {
-            val encrypted = aesCtr(payload, magicKey, iv)
+            val encrypted = aesCtr(pkcs7Pad(obfuscate(payload, mac)), magicKey, iv)
             val header = byteArrayOf(FRAME_ENCRYPTED, payload.size.toByte(), cmd)
-            return header + obfuscate(encrypted, mac)
+            return header + encrypted
+        }
+
+        private fun pkcs7Pad(data: ByteArray): ByteArray {
+            val padding = 16 - data.size % 16
+            return data + ByteArray(padding) { padding.toByte() }
         }
 
         // ---------- Notification helpers -------------------------------------
