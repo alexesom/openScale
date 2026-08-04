@@ -26,6 +26,9 @@ import com.welie.blessed.BluetoothPeripheral
 import kotlinx.coroutines.CoroutineScope
 import java.util.Calendar
 import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.EmptyCoroutineContext
 import org.junit.Test
 
@@ -215,6 +218,169 @@ class HuaweiCH100SHandlerTest {
     }
 
     @Test
+    fun userInfoAck_requestsHistoryOnceWithLegacyFrameLength() {
+        val fixture = Fixture()
+
+        fixture.completeSetup()
+        fixture.transport.writes.clear()
+
+        fixture.sendUserInfoAck()
+        fixture.sendUserInfoAck()
+
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(
+            byteArrayOf(
+                0xDB.toByte(), 0x07, 0x0B,
+                0xB0.toByte(), 0x90.toByte(), 0xF0.toByte(), 0x90.toByte(),
+                0xB0.toByte(), 0xE0.toByte(), 0xA6.toByte(), 0xB2.toByte()
+            )
+        )
+    }
+
+    @Test
+    fun userInfoAck_beforeAuthentication_doesNotRequestHistory() {
+        val fixture = Fixture()
+        fixture.handler.handleConnected(fixture.user)
+        fixture.transport.writes.clear()
+
+        fixture.sendUserInfoAck()
+
+        assertThat(fixture.transport.writes).isEmpty()
+    }
+
+    @Test
+    fun reconnect_requestsHistoryAgain() {
+        val fixture = Fixture()
+
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.handler.handleDisconnected()
+        fixture.completeSetup()
+        fixture.transport.writes.clear()
+
+        fixture.sendUserInfoAck()
+
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()[2]).isEqualTo(0x0B.toByte())
+        fixture.handler.handleDisconnected()
+    }
+
+    @Test
+    fun historyRecord_publishesForSelectedUserAndRequestsNextWithoutFatAck() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.transport.writes.clear()
+
+        val (first, second) = encryptedRecord(measurementData(year = 2000, scaleUserId = 1), history = true)
+        fixture.handler.handleNotification(charRx, first)
+        fixture.user.id = 99
+        fixture.handler.handleNotification(charRx, second)
+
+        assertThat(fixture.published).hasSize(1)
+        assertThat(fixture.published.single().userId).isEqualTo(7)
+        assertThat(Calendar.getInstance().apply { time = requireNotNull(fixture.published.single().dateTime) }.get(Calendar.YEAR))
+            .isEqualTo(2000)
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(
+            byteArrayOf(0xDB.toByte(), 0x02, 0x0B, 0xA0.toByte())
+        )
+    }
+
+    @Test
+    fun malformedHistoryRecord_stillRequestsNext() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.transport.writes.clear()
+
+        fixture.sendRecord(history = true, data = measurementData(year = 1999))
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes.single()[2]).isEqualTo(0x0B.toByte())
+    }
+
+    @Test
+    fun shortHistoryPair_isNotAcknowledged() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.transport.writes.clear()
+        val first = encryptedRecord(measurementData(), history = true).first
+
+        fixture.handler.handleNotification(charRx, first)
+        fixture.handler.handleNotification(charRx, byteArrayOf(0xBC.toByte(), 0x00, 0x90.toByte()))
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).isEmpty()
+    }
+
+    @Test
+    fun liveRecord_sendsOnlyFatResultAck() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.transport.writes.clear()
+
+        fixture.sendRecord(history = false, data = measurementData())
+
+        assertThat(fixture.published).hasSize(1)
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(
+            byteArrayOf(0xDB.toByte(), 0x02, 0x13, 0xA1.toByte())
+        )
+    }
+
+    @Test
+    fun mismatchedEncryptedHalves_areDroppedWithoutAcknowledgement() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.transport.writes.clear()
+        val history = encryptedRecord(measurementData(), history = true)
+        val live = encryptedRecord(measurementData(), history = false)
+
+        fixture.handler.handleNotification(charRx, history.first)
+        fixture.handler.handleNotification(charRx, live.second)
+        fixture.handler.handleNotification(charRx, live.first)
+        fixture.handler.handleNotification(charRx, history.second)
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).isEmpty()
+    }
+
+    @Test
+    fun historyDone_discardsPartialRecord() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.transport.writes.clear()
+        val (first, second) = encryptedRecord(measurementData(), history = true)
+
+        fixture.handler.handleNotification(charRx, first)
+        fixture.handler.handleNotification(charRx, byteArrayOf(0xBD.toByte(), 0x00, 0x19))
+        fixture.handler.handleNotification(charRx, second)
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).isEmpty()
+    }
+
+    @Test
+    fun historyDone_preservesInterleavedLiveRecord() {
+        val fixture = Fixture()
+        fixture.completeSetup()
+        fixture.sendUserInfoAck()
+        fixture.transport.writes.clear()
+        val (first, second) = encryptedRecord(measurementData(), history = false)
+
+        fixture.handler.handleNotification(charRx, first)
+        fixture.handler.handleNotification(charRx, byteArrayOf(0xBD.toByte(), 0x00, 0x19))
+        fixture.handler.handleNotification(charRx, second)
+
+        assertThat(fixture.published).hasSize(1)
+        assertThat(fixture.transport.writes.single()[2]).isEqualTo(0x13.toByte())
+    }
+
+    @Test
     fun malformedControlFrame_isIgnored() {
         val fixture = Fixture()
 
@@ -325,6 +491,23 @@ class HuaweiCH100SHandlerTest {
                 byteArrayOf(0xBD.toByte(), 0x01, 0x26, macXor(byteArrayOf(0x01), mac).single())
             )
         }
+
+        fun completeSetup() {
+            authorise()
+            handler.handleNotification(charRx, byteArrayOf(0xBD.toByte(), 0x00, 0x0C))
+            handler.handleNotification(charRx, byteArrayOf(0xBD.toByte(), 0x00, 0x02))
+            handler.handleNotification(charRx, byteArrayOf(0xBD.toByte(), 0x00, 0x08))
+        }
+
+        fun sendUserInfoAck() {
+            handler.handleNotification(charRx, byteArrayOf(0xBD.toByte(), 0x00, 0x20))
+        }
+
+        fun sendRecord(history: Boolean, data: ByteArray) {
+            val (first, second) = encryptedRecord(data, history)
+            handler.handleNotification(charRx, first)
+            handler.handleNotification(charRx, second)
+        }
     }
 
     private class CapturingTransport : ScaleDeviceHandler.Transport {
@@ -364,6 +547,51 @@ class HuaweiCH100SHandlerTest {
                 out[i] = (out[i].toInt() xor (mac[i % mac.size].toInt() and 0xFF)).toByte()
             }
             return out
+        }
+
+        fun measurementData(year: Int = 2026, scaleUserId: Int = 1) = ByteArray(32).apply {
+            this[0] = scaleUserId.toByte()
+            this[1] = 0xEE.toByte()
+            this[2] = 0x02
+            this[3] = 0xC8.toByte()
+            this[4] = 0x00
+            this[5] = (year and 0xFF).toByte()
+            this[6] = ((year shr 8) and 0xFF).toByte()
+            this[7] = 5
+            this[8] = 10
+            this[9] = 12
+            this[10] = 34
+            this[11] = 56
+            this[12] = 1
+            this[13] = 0xF4.toByte()
+            this[14] = 0x01
+        }
+
+        fun encryptedRecord(data: ByteArray, history: Boolean): Pair<ByteArray, ByteArray> {
+            val auth = byteArrayOf(0x11, 0x22, 0x33, 0x44, 0x55, 0x16, 0x07)
+            val aesKey = hex("3D A2 78 4A FB 87 B1 2A 98 0F DE 34 56 73 21 56")
+            val key = macXor(auth, mac) + aesKey.copyOfRange(7, aesKey.size)
+            val iv = hex("4E F7 64 32 2F DA 76 32 12 3D EB 87 90 FE A2 19")
+            val obfuscated = macXor(data.copyOf(32), mac)
+
+            fun encrypt(block: ByteArray): ByteArray = Cipher.getInstance("AES/CTR/NoPadding").run {
+                init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                doFinal(block)
+            }
+
+            val firstOp = if (history) 0x10 else 0x0E
+            val secondOp = if (history) 0x90 else 0x8E
+            return (byteArrayOf(0xBC.toByte(), 0x10, firstOp.toByte()) +
+                encrypt(obfuscated.copyOfRange(0, 16))) to
+                (byteArrayOf(0xBC.toByte(), 0x10, secondOp.toByte()) +
+                    encrypt(obfuscated.copyOfRange(16, 32)))
+        }
+
+        fun hex(value: String): ByteArray {
+            val clean = value.replace(" ", "")
+            return ByteArray(clean.length / 2) { index ->
+                clean.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+            }
         }
     }
 }

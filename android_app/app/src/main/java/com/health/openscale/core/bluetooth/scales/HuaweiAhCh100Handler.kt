@@ -48,9 +48,10 @@ import kotlin.math.min
  *
  * History (so future maintainers don't repeat past mistakes):
  *
- *  - openScale **v2.5.4** had a working Java handler. It AES-CTR-decrypted
- *    *only* the first half of the two-part measurement frame and parsed the
- *    documented byte layout. See `BluetoothHuaweiAH100.java` in tag v2.5.4.
+ *  - openScale **v2.5.4** had a working Java handler, but only parsed the
+ *    first half of the two-part measurement frame. The Huawei app decrypts
+ *    both 16-byte halves independently, reconstructs the payload, and then
+ *    removes the MAC XOR layer.
  *  - The 3.x Kotlin rewrite (commit 2e7e708f and follow-ups) accidentally
  *    dropped the AES decryption entirely and replaced the byte layout with
  *    invented offsets. That produced the 138 kg / 180 % / year-3084 nonsense
@@ -58,12 +59,9 @@ import kotlin.math.min
  *  - Issue #1276 proposed a partial fix (decrypt the merged buffer instead
  *    of the first half) which is mathematically equivalent for the first 16
  *    bytes — but the contributor's account was deleted before it landed.
- *  - This handler restores the v2.5.4 behaviour exactly. It uses the default
- *    BLE tuning profile (Balanced, MTU bumped to 185); the legacy CST34M97
- *    firmware sometimes ships the whole composition in a single fat
- *    notification at that MTU instead of the paired 16-byte halves
- *    v2.5.4 saw at MTU 23. [tryDecodeFirstHalfImmediately] handles both
- *    shapes, so we don't need to pin the conservative profile.
+ *  - This handler follows the Huawei app's paired-frame behaviour. It uses
+ *    the default BLE tuning profile (Balanced, MTU bumped to 185); the
+ *    protocol still delivers two logical encrypted blocks.
  *  - Real-world note: when migrating from openScale 2.5.x or Huawei Health
  *    on the same phone, users may need to "Forget" the scale once in the
  *    Android Bluetooth settings. The link-layer encryption keys from the
@@ -127,12 +125,6 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
 
         sessionMac = device.address
 
-        // The hardware *can* upload history records (see NTFY_HISTORY_RECORD
-        // in onNotification + sendGetHistoryNext), but we don't actively
-        // pull the full history yet — `sendGetHistoryFirst()` is wired but
-        // not invoked from the lifecycle. Advertise it as a capability so
-        // the UI knows the device supports it; mark only what's actually
-        // hooked up as implemented.
         val caps = setOf(
             DeviceCapability.BODY_COMPOSITION,
             DeviceCapability.TIME_SYNC,
@@ -142,17 +134,13 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         val implemented = setOf(
             DeviceCapability.BODY_COMPOSITION,
             DeviceCapability.TIME_SYNC,
-            DeviceCapability.USER_SYNC
+            DeviceCapability.USER_SYNC,
+            DeviceCapability.HISTORY_READ
         )
         return DeviceSupport(
             displayName = supportedAdverts.getValue(matchedAdvert),
             capabilities = caps,
             implemented = implemented,
-            // Use the default Balanced tuning. The handler decodes the
-            // measurement from the first half as soon as it arrives (see
-            // tryDecodeFirstHalfImmediately), so it works whether the scale
-            // sends paired 16-byte halves at MTU 23 or a single fat frame
-            // at the negotiated MTU 185 — no need to force the legacy MTU.
             linkMode = LinkMode.CONNECT_GATT
         )
     }
@@ -165,16 +153,20 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
     private var authorised = false
     private var scaleAwake = false
     private var scaleBound = false
+    private var sessionUser: ScaleUser? = null
     private var lastMeasuredWeightTenthKg: Int = -1
 
     // First half of an encrypted measurement, awaiting its 0x8E/0x90 sibling.
     private var pendingFirst: ByteArray? = null
     private var pendingType: Byte = 0x00
+    private var historyRequested = false
+    private var historyActive = false
 
     // --- Lifecycle ---------------------------------------------------------
 
     override fun onConnected(user: ScaleUser) {
-        authCode = buildAuthToken(user.id)
+        sessionUser = user.copy()
+        authCode = buildAuthToken(requireNotNull(sessionUser).id)
         triesAuth = 0
         authorised = false
         scaleAwake = false
@@ -182,9 +174,22 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         magicKey = null
         pendingFirst = null
         pendingType = 0x00
+        historyRequested = false
+        historyActive = false
 
         setNotifyOn(SERVICE, CHAR_RX)
         userInfo(R.string.bt_info_step_on_scale)
+    }
+
+    override fun onDisconnected() {
+        authorised = false
+        scaleAwake = false
+        magicKey = null
+        sessionUser = null
+        pendingFirst = null
+        pendingType = 0x00
+        historyRequested = false
+        historyActive = false
     }
 
     override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
@@ -209,7 +214,7 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
                     magicKey = deriveMagicKey(authCode, macBytes())
                     sendSetUnit()
                     sendSetTime()
-                    sendUserInfo(user, lastMeasuredWeightTenthKg.takeIf { it > 0 })
+                    sendUserInfo(requireNotNull(sessionUser), lastMeasuredWeightTenthKg.takeIf { it > 0 })
                     sendGetVersion()
                     userInfo(R.string.bt_info_step_on_scale)
                 } else {
@@ -231,24 +236,25 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
             NTFY_UNITS_SET,
             NTFY_SCALE_CLOCK,
             NTFY_SCALE_VERSION,
-            NTFY_HISTORY_UPLOAD_DONE,
             NTFY_GO_SLEEP -> {
                 // benign acks / state transitions
             }
 
+            NTFY_HISTORY_UPLOAD_DONE -> {
+                historyActive = false
+                if (pendingType == NTFY_HISTORY_RECORD) {
+                    pendingFirst = null
+                    pendingType = 0x00
+                }
+            }
+
             // First halves of two-part encrypted measurement / history frame.
             NTFY_MEASUREMENT, NTFY_HISTORY_RECORD -> {
-                if (data[0] == FRAME_NOTIFY_ENCRYPTED) {
+                if (data[0] == FRAME_NOTIFY_ENCRYPTED &&
+                    (op != NTFY_HISTORY_RECORD || historyActive)
+                ) {
                     pendingType = op
                     pendingFirst = data
-                    // MTU resilience: if the first half already contains a
-                    // full v2.5.4-shaped record (≥ 15 deobf bytes of plaintext),
-                    // we can decode immediately. The scale on Balanced/Aggressive
-                    // tuning sometimes packs the whole composition into one fat
-                    // notification because the negotiated MTU is large enough.
-                    if (deobfTail.size >= 15) {
-                        tryDecodeFirstHalfImmediately(op)
-                    }
                 }
             }
 
@@ -258,8 +264,11 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
                     val type = pendingType
                     pendingFirst = null
                     pendingType = 0x00
-                    if (first != null) {
-                        decodeAndPublish(first, type)
+                    val expectedType = if (op == NTFY_MEASUREMENT2) NTFY_MEASUREMENT else NTFY_HISTORY_RECORD
+                    if (first != null && type == expectedType) {
+                        decodeAndPublish(first, data, type)
+                    } else {
+                        logW("Measurement second half did not match a pending first half")
                     }
                 }
             }
@@ -270,13 +279,14 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
             }
 
             NTFY_USER_CHANGED -> {
-                // Scale asks for user info again (e.g. after restart). The
-                // payload is AES-encrypted with magicKey, so this is only
-                // meaningful after AUTH succeeded; ignore otherwise.
-                if (authorised) {
-                    sendUserInfo(user, lastMeasuredWeightTenthKg.takeIf { it > 0 })
+                // The official app treats 0x20 as the USER_INFO/list-update
+                // acknowledgement and starts the per-user history query here.
+                if (authorised && !historyRequested) {
+                    sendGetHistoryFirst()
+                    historyRequested = true
+                    historyActive = true
                 } else {
-                    logD("NTFY_USER_CHANGED received before auth; ignoring")
+                    logD("NTFY_USER_CHANGED received before auth or after history started; ignoring")
                 }
             }
 
@@ -284,48 +294,45 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         }
     }
 
-    private fun tryDecodeFirstHalfImmediately(type: Byte) {
-        val first = pendingFirst ?: return
-        val mk = magicKey ?: return
-        try {
-            val m = decodeFirstHalf(first, mk, macBytes())
-            publishMeasurement(m, viaSingleFrame = true)
-            // We've consumed the data; if the second half ever arrives the
-            // 0x8E branch will see pendingFirst = null and silently drop it.
-            pendingFirst = null
-            pendingType = 0x00
-            if (type == NTFY_HISTORY_RECORD) sendGetHistoryNext()
-        } catch (t: Throwable) {
-            // Not enough bytes / decrypt error — fall through and wait for
-            // the second half before publishing.
-            logD("first-half early decode failed: ${t.message}")
-        }
-    }
-
-    private fun decodeAndPublish(first: ByteArray, type: Byte) {
-        val mk = magicKey ?: run {
-            logW("magicKey missing; dropping measurement")
+    private fun decodeAndPublish(first: ByteArray, second: ByteArray, type: Byte) {
+        val isHistory = type == NTFY_HISTORY_RECORD
+        val mk = magicKey
+        val user = sessionUser
+        if (mk == null || user == null || first.size < 19 || second.size < 19) {
+            logW("Incomplete encrypted measurement pair or missing session state")
             return
         }
-        try {
-            val m = decodeFirstHalf(first, mk, macBytes())
-            publishMeasurement(m, viaSingleFrame = false)
+        val measurement = try {
+            decodePair(first, second, mk, macBytes())
         } catch (e: GeneralSecurityException) {
             logW("AES-CTR failed on measurement: ${e.message}")
             return
         } catch (e: IllegalArgumentException) {
             logW("Measurement parse failed: ${e.message}")
+            if (isHistory) sendGetHistoryNext()
             return
         }
-        if (type == NTFY_HISTORY_RECORD) sendGetHistoryNext()
+
+        val published = publishMeasurement(measurement, user, isHistory)
+        if (isHistory) {
+            sendGetHistoryNext()
+        } else if (published) {
+            sendCmd(CMD_FAT_RESULT_ACK, byteArrayOf(0x00))
+        }
     }
 
-    private fun publishMeasurement(m: Measurement, viaSingleFrame: Boolean) {
+    private fun publishMeasurement(m: Measurement, user: ScaleUser, isHistory: Boolean): Boolean {
+        val timestamp = m.dateTime ?: if (isHistory) {
+            logW("History record has an invalid timestamp; dropping it")
+            return false
+        } else {
+            Date()
+        }
         lastMeasuredWeightTenthKg = (m.weightKg * 10f).toInt()
 
         val sm = ScaleMeasurement().apply {
-            this.userId = m.userId
-            this.dateTime = m.dateTime ?: Date()
+            this.userId = user.id
+            this.dateTime = timestamp
             this.weight = m.weightKg
             this.fat = m.fatPct
             // The scale reports impedance but the v2.5.4 reference doesn't
@@ -338,11 +345,10 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         publish(sm)
         logI(
             "Measurement: ${m.weightKg} kg, fat=${m.fatPct}%, impedance=${m.impedanceOhm} Ω, " +
-                "userId=${m.userId} @ ${m.dateTime?.let(::ts) ?: "now"} " +
-                "(${if (viaSingleFrame) "single-frame" else "paired"})"
+                "userId=${user.id} (scale user ${m.userId}) @ ${ts(timestamp)} " +
+                "(${if (isHistory) "history" else "live"})"
         )
-
-        sendCmd(CMD_FAT_RESULT_ACK, byteArrayOf(0x00))
+        return true
     }
 
     // --- Commands ----------------------------------------------------------
@@ -399,7 +405,6 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
 
     private fun sendGetVersion() = sendCmd(CMD_GET_VERSION, byteArrayOf())
 
-    @Suppress("unused") // hooked up when we re-enable history pulls
     private fun sendGetHistoryFirst() {
         // Legacy: payload is auth || xor(auth), but lengthByte on wire is
         // 7 (legacy used "0x07 - 1" + 1 inside AHsendCommand → 0x07).
@@ -518,12 +523,10 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
      *     0x0E (live) or 0x10 (history); the second half carries 0x8E / 0x90.
      *
      * Measurement decoding:
-     * - **Decrypt only the first half's deobfuscated tail** (this is what
-     *   v2.5.4 does and what the captures confirm). The keystream of AES-CTR
-     *   is contiguous so decrypting the merged buffer would give the same
-     *   bytes for the first 16, but the second half then contains junk; we
-     *   keep things simple and decrypt just what we need.
-     * - The decrypted layout is documented on [parseMeasurement].
+     * - Decrypt both 16-byte notification blocks independently with the IV
+     *   reset for each block, concatenate them, then remove the continuous
+     *   MAC XOR layer. This matches Huawei's official app.
+     * - The resulting layout is documented on [parseMeasurement].
      */
     internal companion object {
 
@@ -737,16 +740,21 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
             val weightTenth = u16le(decrypted, 1)
             val fatTenth = u16le(decrypted, 3)
             val year = u16le(decrypted, 5)
-            val month = (decrypted[7].toInt() and 0xFF).coerceIn(1, 12)
+            val month = decrypted[7].toInt() and 0xFF
             val day = decrypted[8].toInt() and 0xFF
             val hour = decrypted[9].toInt() and 0xFF
             val minute = decrypted[10].toInt() and 0xFF
             val second = decrypted[11].toInt() and 0xFF
             val impedance = u16le(decrypted, 13)
 
+            require(weightTenth / 10f in 2.0f..350.0f) { "implausible weight" }
+            require(fatTenth / 10f in 0.0f..75.0f) { "implausible body fat" }
+            require(year in 2000..2099) { "implausible year" }
+
             val date: Date? = try {
                 val cal = Calendar.getInstance().apply {
                     clear()
+                    isLenient = false
                     set(year, month - 1, day, hour, minute, second)
                 }
                 cal.time
@@ -765,17 +773,22 @@ class HuaweiAhCh100Handler : ScaleDeviceHandler() {
         }
 
         /**
-         * Convenience: take the *first half* of a two-part encrypted measurement
-         * exactly as it arrived from the scale (3-byte header + obfuscated tail),
-         * de-obfuscate, AES-CTR-decrypt with [magicKey] / [INITIAL_IV], and
-         * parse via [parseMeasurement]. The second half is intentionally not
-         * required — v2.5.4 ignored it and that captures-as-tested produces the
-         * correct numbers.
+         * Decode the two encrypted notification blocks exactly as Huawei's app:
+         * AES-CTR each 16-byte block with a fresh IV, concatenate, then remove
+         * the MAC XOR layer over the complete 32-byte payload.
          */
-        fun decodeFirstHalf(firstHalfFrame: ByteArray, magicKey: ByteArray, mac: ByteArray): Measurement {
-            val deobf = deobfuscateTail(firstHalfFrame, mac)
-            val plain = aesCtr(deobf, magicKey, INITIAL_IV)
-            return parseMeasurement(plain)
+        fun decodePair(
+            firstHalfFrame: ByteArray,
+            secondHalfFrame: ByteArray,
+            magicKey: ByteArray,
+            mac: ByteArray
+        ): Measurement {
+            require(firstHalfFrame.size >= 19 && secondHalfFrame.size >= 19) {
+                "encrypted measurement halves must each contain 16 payload bytes"
+            }
+            val first = aesCtr(firstHalfFrame.copyOfRange(3, 19), magicKey, INITIAL_IV)
+            val second = aesCtr(secondHalfFrame.copyOfRange(3, 19), magicKey, INITIAL_IV)
+            return parseMeasurement(obfuscate(first + second, mac))
         }
 
         // ---------- Internal utils -------------------------------------------

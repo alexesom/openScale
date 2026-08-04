@@ -97,12 +97,15 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     private var magicKey: ByteArray? = null
     private var triesAuth = 0
     private var authorised = false
+    private var sessionUser: ScaleUser? = null
     @Volatile private var lastOutboundAtMs = 0L
     @Volatile private var heartbeatTimer: Timer? = null
     private var lastWeightTenthKg: Int = -1
 
     private var pendingType: Byte = 0x00
     private var pendingFirst: ByteArray? = null
+    private var historyRequested = false
+    private var historyActive = false
 
     // --- Notification opcodes -------------------------------------------------
 
@@ -135,14 +138,18 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     // --- Lifecycle ------------------------------------------------------------
 
     override fun onConnected(user: ScaleUser) {
-        authCode = buildAuthToken(user.id)
+        sessionUser = user.copy()
+        authCode = buildAuthToken(requireNotNull(sessionUser).id)
         setNotifyOn(SERVICE, CHAR_RX)
         triesAuth = 0
         authorised = false
+        magicKey = null
         lastOutboundAtMs = 0L
         stopHeartbeat()
         pendingType = 0x00
         pendingFirst = null
+        historyRequested = false
+        historyActive = false
         userInfo(R.string.bt_info_step_on_scale)
     }
 
@@ -182,14 +189,19 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
             OP_UNITS_SET -> sendSetTime()
 
-            OP_CLOCK -> sendUserInfo(user, lastWeightTenthKg.takeIf { it > 0 })
+            OP_CLOCK -> sendUserInfo(requireNotNull(sessionUser), lastWeightTenthKg.takeIf { it > 0 })
 
             OP_USER_CHANGED -> {
                 logD("CH100S user info/list update ack")
+                if (authorised && !historyRequested) {
+                    historyRequested = true
+                    historyActive = true
+                    sendGetHistoryFirst()
+                }
             }
 
             OP_MEAS_P1, OP_HIST_P1 -> {
-                if (data[0] == 0xBC.toByte()) {
+                if (data[0] == 0xBC.toByte() && (op == OP_MEAS_P1 || historyActive)) {
                     pendingType = op
                     pendingFirst = data
                 }
@@ -201,11 +213,23 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
                     val type = pendingType
                     pendingFirst = null
                     pendingType = 0x00
-                    if (first != null) handleEncryptedPair(first, data, type)
+                    val expectedType = if (op == OP_MEAS_P2) OP_MEAS_P1 else OP_HIST_P1
+                    if (first != null && type == expectedType) {
+                        handleEncryptedPair(first, data, type)
+                    } else {
+                        logW("Measurement second half did not match a pending first half")
+                    }
                 }
             }
 
-            OP_HIST_DONE -> { /* history upload complete */ }
+            OP_HIST_DONE -> {
+                historyActive = false
+                if (pendingType == OP_HIST_P1) {
+                    pendingType = 0x00
+                    pendingFirst = null
+                }
+                logD("CH100S history upload complete")
+            }
 
             OP_BIND_OK -> { /* ack */ }
 
@@ -218,22 +242,31 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     // --- Measurement decryption & parsing ------------------------------------
 
     private fun handleEncryptedPair(first: ByteArray, second: ByteArray, type: Byte) {
-        val rawP1 = first.copyOfRange(3, min(first.size, 19))
-        val rawP2 = second.copyOfRange(3, min(second.size, 19))
-
-        val key = magicKey ?: AES_KEY
-        val decP1 = try { aesCtr(rawP1, key) } catch (e: GeneralSecurityException) {
-            logW("AES P1: ${e.message}"); rawP1
+        val key = magicKey
+        if (key == null || first.size < 19 || second.size < 19) {
+            logW("Incomplete encrypted measurement pair or missing session key")
+            return
         }
-        val decP2 = try { aesCtr(rawP2, key) } catch (e: GeneralSecurityException) {
-            logW("AES P2: ${e.message}"); rawP2
+        val rawP1 = first.copyOfRange(3, 19)
+        val rawP2 = second.copyOfRange(3, 19)
+
+        val decP1: ByteArray
+        val decP2: ByteArray
+        try {
+            decP1 = aesCtr(rawP1, key)
+            decP2 = aesCtr(rawP2, key)
+        } catch (e: GeneralSecurityException) {
+            logW("AES measurement decode failed: ${e.message}")
+            return
         }
 
         val data = macXor(concat(decP1, decP2))
         logD("Decrypted (${data.size}b): ${hex(data, 0, min(data.size, 20))}…")
 
         when (type) {
-            OP_MEAS_P1 -> parseAndPublish(data)
+            OP_MEAS_P1 -> {
+                if (parseAndPublish(data)) sendPlain(CMD_FAT_ACK, byteArrayOf(0x00))
+            }
             OP_HIST_P1 -> {
                 parseAndPublish(data)
                 sendPlain(CMD_GET_RECORD, byteArrayOf(0x01))
@@ -258,10 +291,10 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
      * | 12     | Day of week          | uint8                       |
      * | 13-14  | Impedance            | LE uint16, ohms             |
      */
-    private fun parseAndPublish(data: ByteArray) {
+    private fun parseAndPublish(data: ByteArray): Boolean {
         if (data.size < 15) {
             logW("Frame too short: ${data.size}")
-            return
+            return false
         }
 
         val userId    = data[0].toInt() and 0xFF
@@ -277,7 +310,7 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
 
         if (weight !in 2.0f..350.0f ||
             fat !in 0.0f..75.0f ||
-            y !in 2020..2099 ||
+            y !in 2000..2099 ||
             mo !in 1..12 ||
             d !in 1..31 ||
             h !in 0..23 ||
@@ -285,17 +318,25 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
             s !in 0..59
         ) {
             logW("Dropped implausible CH100S frame: ${frameSummary(data)}")
-            return
+            return false
         }
 
         val dt = try {
-            Calendar.getInstance().apply { set(y, mo - 1, d, h, mi, s) }.time
-        } catch (_: Exception) { Date() }
+            Calendar.getInstance().apply {
+                clear()
+                isLenient = false
+                set(y, mo - 1, d, h, mi, s)
+            }.time
+        } catch (_: Exception) {
+            logW("Dropped invalid CH100S calendar date: ${frameSummary(data)}")
+            return false
+        }
 
         lastWeightTenthKg = (weight * 10).toInt()
+        val user = sessionUser ?: currentAppUser()
 
         val m = ScaleMeasurement().apply {
-            this.userId = userId
+            this.userId = user.id
             this.dateTime = dt
             this.weight = weight
             this.fat = fat
@@ -303,7 +344,6 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
                 this.impedance = impedance.toDouble()
                 // Water%, muscle%, bone, BMR, visceral fat are not sent by the scale.
                 // Compute app-side from impedance using BIA formulas (Chipsea chipset).
-                val user = currentAppUser()
                 val lib = EtekcityLib(
                     gender = user.gender,
                     age = user.age,
@@ -319,8 +359,8 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
             }
         }
         publish(m)
-        logI("Measurement: $weight kg, fat=$fat%, imp=$impedance Ω, user=$userId @ ${ts(dt)}")
-        sendPlain(CMD_FAT_ACK, byteArrayOf(0x00))
+        logI("Measurement: $weight kg, fat=$fat%, imp=$impedance Ω, scaleUser=$userId appUser=${user.id} @ ${ts(dt)}")
+        return true
     }
 
     // --- Commands -------------------------------------------------------------
@@ -352,6 +392,14 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
             write(le16(0xFFFF))
         }.toByteArray()
         sendEncrypted(CMD_USER_INFO, payload)
+    }
+
+    private fun sendGetHistoryFirst() {
+        val checksum = authCode.fold(0) { acc, byte -> acc xor (byte.toInt() and 0xFF) }.toByte()
+        val payload = authCode + checksum
+        val packet = concat(byteArrayOf(0xDB.toByte(), 0x07, CMD_GET_RECORD), macXor(payload))
+        lastOutboundAtMs = SystemClock.elapsedRealtime()
+        writeTo(SERVICE, CHAR_TX, packet, withResponse = true)
     }
 
     // --- Wire helpers ---------------------------------------------------------
@@ -398,6 +446,12 @@ class HuaweiCH100SHandler : ScaleDeviceHandler() {
     override fun onDisconnected() {
         stopHeartbeat()
         authorised = false
+        magicKey = null
+        sessionUser = null
+        historyRequested = false
+        historyActive = false
+        pendingType = 0x00
+        pendingFirst = null
     }
 
     // --- Crypto ---------------------------------------------------------------

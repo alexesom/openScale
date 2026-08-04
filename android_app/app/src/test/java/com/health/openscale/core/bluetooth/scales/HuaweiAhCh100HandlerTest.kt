@@ -18,9 +18,18 @@
 package com.health.openscale.core.bluetooth.scales
 
 import com.google.common.truth.Truth.assertThat
+import com.health.openscale.core.bluetooth.data.ScaleMeasurement
+import com.health.openscale.core.bluetooth.data.ScaleUser
+import com.health.openscale.core.data.GenderType
+import com.health.openscale.core.service.ScannedDeviceInfo
+import com.welie.blessed.BluetoothPeripheral
+import kotlinx.coroutines.CoroutineScope
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.util.Calendar
 import java.util.TimeZone
+import java.util.UUID
+import kotlin.coroutines.EmptyCoroutineContext
 
 /**
  * Unit tests for [HuaweiAhCh100Handler] — the wire-protocol primitives
@@ -51,10 +60,20 @@ class HuaweiAhCh100HandlerTest {
         private const val FIXTURE_LIGHT_PLAINTEXT = "012802bc00ea07010f071e0a04e801"
         private const val FIXTURE_HEAVY_PLAINTEXT = "0104056001ea070301132d00076402"
 
-        // Frames as they go on the wire: [0xBC, len, 0x0E, ...obfuscated(AES(plaintext))...]
-        private const val FIXTURE_USER_FRAME  = "bc100edef702c9bbf2176c755b6eccdd5b92b0"
-        private const val FIXTURE_LIGHT_FRAME = "bc100ede15036dbaf2176869547ce7dbaf91b0"
-        private const val FIXTURE_HEAVY_FRAME = "bc100ede3904b1bbf2176a67404fedd82392b0"
+        // Golden paired frames as sent on the wire. AES-CTR restarts for each
+        // block; MAC XOR spans the reconstructed 32-byte plaintext.
+        private const val FIXTURE_USER_FRAME1  = "bc200edef702c9bbf2176c755b6eccdd5b92b0"
+        private const val FIXTURE_LIGHT_FRAME1 = "bc200ede15036dbaf2176869547ce7dbaf91b0"
+        private const val FIXTURE_HEAVY_FRAME1 = "bc200ede3904b1bbf2176a67404fedd82392b0"
+        private const val FIXTURE_FRAME2 = "bc208ef8b88e13125f37ece991caaaf8c21f72"
+
+        // Same measurement encrypted for selected app user 7, while the scale
+        // record itself still carries its local user id 1.
+        private const val HISTORY_FRAME1 = "bc2010d1d404a3c6d3d6bd4bf934a17217136a"
+        private const val HISTORY_FRAME2 = "bc2090f79b88796f7ef63dd73390c7578e9ea8"
+        private const val INVALID_DATE_HISTORY_FRAME1 = "bc2010d1d404a3c6d3d6b54bf934a17217136a"
+        private const val INVALID_DATE_HISTORY_FRAME2 = HISTORY_FRAME2
+        val CHAR_RX: UUID = UUID.fromString("0000faa2-0000-1000-8000-00805f9b34fb")
     }
 
     // -- Primitives ----------------------------------------------------------
@@ -178,6 +197,114 @@ class HuaweiAhCh100HandlerTest {
         assertThat(pt).isEqualTo(payload)
     }
 
+    // -- History lifecycle --------------------------------------------------
+
+    @Test
+    fun `history capability starts exact user query once after user-info acknowledgement`() {
+        val fixture = Fixture()
+
+        assertThat(fixture.support.implemented).contains(DeviceCapability.HISTORY_READ)
+        fixture.authorise()
+        fixture.transport.writes.clear()
+
+        fixture.acknowledgeUserInfo()
+        fixture.acknowledgeUserInfo()
+
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(hex("db070b4de8e04c2e595bca"))
+    }
+
+    @Test
+    fun `history pair publishes for selected user then requests next without fat ack`() {
+        val fixture = Fixture()
+        fixture.authoriseAndStartHistory()
+        fixture.transport.writes.clear()
+
+        fixture.notify(HISTORY_FRAME1)
+        assertThat(fixture.published).isEmpty()
+        fixture.user.id = 99
+        fixture.notify(HISTORY_FRAME2)
+
+        assertThat(fixture.published).hasSize(1)
+        assertThat(fixture.published.single().userId).isEqualTo(7)
+        assertThat(fixture.published.single().weight).isWithin(1e-4f).of(97.0f)
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(hex("db020b5d"))
+    }
+
+    @Test
+    fun `bad history timestamp is dropped but still requests next`() {
+        val fixture = Fixture()
+        fixture.authoriseAndStartHistory()
+        fixture.transport.writes.clear()
+
+        fixture.notify(INVALID_DATE_HISTORY_FRAME1)
+        fixture.notify(INVALID_DATE_HISTORY_FRAME2)
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(hex("db020b5d"))
+    }
+
+    @Test
+    fun `short history pair is not acknowledged`() {
+        val fixture = Fixture()
+        fixture.authoriseAndStartHistory()
+        fixture.transport.writes.clear()
+
+        fixture.notify(HISTORY_FRAME1)
+        fixture.notify("bc0090")
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).isEmpty()
+    }
+
+    @Test
+    fun `live pair publishes and sends only fat-result ack`() {
+        val fixture = Fixture()
+        fixture.authorise()
+        fixture.transport.writes.clear()
+
+        fixture.notify(HISTORY_FRAME1.replace("bc2010", "bc200e"))
+        fixture.notify(HISTORY_FRAME2.replace("bc2090", "bc208e"))
+
+        assertThat(fixture.published).hasSize(1)
+        assertThat(fixture.published.single().userId).isEqualTo(fixture.user.id)
+        assertThat(fixture.transport.writes).hasSize(1)
+        assertThat(fixture.transport.writes.single()).isEqualTo(hex("db02135c"))
+    }
+
+    @Test
+    fun `malformed live pair is not acknowledged`() {
+        val fixture = Fixture()
+        fixture.authorise()
+        fixture.transport.writes.clear()
+
+        fixture.notify(HISTORY_FRAME1.replace("bc2010", "bc200e"))
+        fixture.notify("bc008e")
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).isEmpty()
+    }
+
+    @Test
+    fun `history completion clears a partial pair and reconnect starts a fresh query`() {
+        val fixture = Fixture()
+        fixture.authoriseAndStartHistory()
+        fixture.transport.writes.clear()
+        fixture.notify(HISTORY_FRAME1)
+
+        fixture.handler.handleNotification(CHAR_RX, hex("bd0019"))
+        fixture.notify(HISTORY_FRAME2)
+
+        assertThat(fixture.published).isEmpty()
+        assertThat(fixture.transport.writes).isEmpty()
+
+        fixture.handler.handleDisconnected()
+        fixture.authoriseAndStartHistory()
+        assertThat(fixture.transport.writes.last()).isEqualTo(hex("db070b4de8e04c2e595bca"))
+    }
+
     // -- Measurement decoding ------------------------------------------------
 
     @Test
@@ -220,12 +347,38 @@ class HuaweiAhCh100HandlerTest {
         }
     }
 
+    @Test
+    fun `parseMeasurement accepts documented reset-clock year 2000`() {
+        val data = hex(FIXTURE_USER_PLAINTEXT).apply {
+            this[5] = 0xD0.toByte()
+            this[6] = 0x07
+        }
+
+        val measurement = HuaweiAhCh100Handler.parseMeasurement(data)
+
+        assertThat(Calendar.getInstance().apply { time = requireNotNull(measurement.dateTime) }.get(Calendar.YEAR))
+            .isEqualTo(2000)
+    }
+
+    @Test
+    fun `parseMeasurement rejects years before reset-clock epoch`() {
+        val data = hex(FIXTURE_USER_PLAINTEXT).apply {
+            this[5] = 0x01
+            this[6] = 0x00
+        }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            HuaweiAhCh100Handler.parseMeasurement(data)
+        }
+    }
+
     // -- End-to-end frame -> measurement -------------------------------------
 
     @Test
-    fun `decodeFirstHalf round-trips user fixture frame to 97 kg 28 percent`() {
+    fun `decodePair round-trips user fixture frames to 97 kg 28 percent`() {
         assertFrameDecodes(
-            FIXTURE_USER_FRAME,
+            FIXTURE_USER_FRAME1,
+            FIXTURE_FRAME2,
             expectedWeight = 97.0f,
             expectedFat = 28.0f,
             expectedImpedance = 540,
@@ -233,9 +386,10 @@ class HuaweiAhCh100HandlerTest {
     }
 
     @Test
-    fun `decodeFirstHalf round-trips light fixture frame to 55_2 kg 18_8 percent`() {
+    fun `decodePair round-trips light fixture frames to 55_2 kg 18_8 percent`() {
         assertFrameDecodes(
-            FIXTURE_LIGHT_FRAME,
+            FIXTURE_LIGHT_FRAME1,
+            FIXTURE_FRAME2,
             expectedWeight = 55.2f,
             expectedFat = 18.8f,
             expectedImpedance = 488,
@@ -243,9 +397,10 @@ class HuaweiAhCh100HandlerTest {
     }
 
     @Test
-    fun `decodeFirstHalf round-trips heavy fixture frame to 128_4 kg 35_2 percent`() {
+    fun `decodePair round-trips heavy fixture frames to 128_4 kg 35_2 percent`() {
         assertFrameDecodes(
-            FIXTURE_HEAVY_FRAME,
+            FIXTURE_HEAVY_FRAME1,
+            FIXTURE_FRAME2,
             expectedWeight = 128.4f,
             expectedFat = 35.2f,
             expectedImpedance = 612,
@@ -258,7 +413,7 @@ class HuaweiAhCh100HandlerTest {
         // master parser would compute (1457 - byte[1]) / 10 on the raw
         // deobfuscated buffer, which deliberately *does not* equal 97.0.
         val mac = HuaweiAhCh100Handler.macStringToBytes(TEST_MAC)
-        val frame = hex(FIXTURE_USER_FRAME)
+        val frame = hex(FIXTURE_USER_FRAME1)
         val deobfTail = HuaweiAhCh100Handler.deobfuscateTail(frame, mac)
         val brokenWeight = (1457 - (deobfTail[1].toInt() and 0xFF)) / 10.0f
         assertThat(brokenWeight).isNotWithin(1e-4f).of(97.0f)
@@ -267,14 +422,15 @@ class HuaweiAhCh100HandlerTest {
     // -- Helpers -------------------------------------------------------------
 
     private fun assertFrameDecodes(
-        frameHex: String,
+        firstFrameHex: String,
+        secondFrameHex: String,
         expectedWeight: Float,
         expectedFat: Float,
         expectedImpedance: Int,
     ) {
         val mac = HuaweiAhCh100Handler.macStringToBytes(TEST_MAC)
         val mk = HuaweiAhCh100Handler.hexToBytes(EXPECTED_MAGIC_KEY)
-        val m = HuaweiAhCh100Handler.decodeFirstHalf(hex(frameHex), mk, mac)
+        val m = HuaweiAhCh100Handler.decodePair(hex(firstFrameHex), hex(secondFrameHex), mk, mac)
         assertThat(m.weightKg).isWithin(1e-4f).of(expectedWeight)
         assertThat(m.fatPct).isWithin(1e-4f).of(expectedFat)
         assertThat(m.impedanceOhm).isEqualTo(expectedImpedance)
@@ -301,4 +457,87 @@ class HuaweiAhCh100HandlerTest {
 
     private fun hex(s: String): ByteArray = HuaweiAhCh100Handler.hexToBytes(s)
     private fun toHex(b: ByteArray): String = b.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+
+    private class Fixture {
+        val published = mutableListOf<ScaleMeasurement>()
+        val user = ScaleUser(
+            id = 7,
+            birthday = Calendar.getInstance().apply { set(1991, Calendar.JANUARY, 2) }.time,
+            bodyHeight = 180f,
+            gender = GenderType.MALE,
+            initialWeight = 75f
+        )
+        val handler = HuaweiAhCh100Handler()
+        val transport = CapturingTransport()
+        val support = requireNotNull(
+            handler.supportFor(
+                ScannedDeviceInfo(
+                    name = "AH100",
+                    address = TEST_MAC,
+                    rssi = -50,
+                    serviceUuids = emptyList(),
+                    manufacturerData = null
+                )
+            )
+        )
+
+        init {
+            handler.attach(
+                transport = transport,
+                callbacks = object : ScaleDeviceHandler.Callbacks {
+                    override fun onPublish(measurement: ScaleMeasurement) {
+                        published += measurement
+                    }
+
+                    override fun resolveString(resId: Int, vararg args: Any) = "res:$resId"
+                },
+                settings = object : ScaleDeviceHandler.DriverSettings {
+                    override fun getInt(key: String, default: Int) = default
+                    override fun putInt(key: String, value: Int) = Unit
+                    override fun getString(key: String, default: String?) = default
+                    override fun putString(key: String, value: String) = Unit
+                    override fun remove(key: String) = Unit
+                },
+                data = object : ScaleDeviceHandler.DataProvider {
+                    override fun currentUser() = user
+                    override fun usersForDevice() = listOf(user)
+                    override fun lastMeasurementFor(userId: Int): ScaleMeasurement? = null
+                },
+                scope = CoroutineScope(EmptyCoroutineContext)
+            )
+        }
+
+        fun authorise() {
+            handler.handleConnected(user)
+            handler.handleNotification(CHAR_RX, HuaweiAhCh100Handler.hexToBytes("bd0000"))
+            handler.handleNotification(CHAR_RX, HuaweiAhCh100Handler.hexToBytes("bd01265d"))
+        }
+
+        fun acknowledgeUserInfo() {
+            handler.handleNotification(CHAR_RX, HuaweiAhCh100Handler.hexToBytes("bd0020"))
+        }
+
+        fun authoriseAndStartHistory() {
+            authorise()
+            acknowledgeUserInfo()
+        }
+
+        fun notify(frame: String) {
+            handler.handleNotification(CHAR_RX, HuaweiAhCh100Handler.hexToBytes(frame))
+        }
+    }
+
+    private class CapturingTransport : ScaleDeviceHandler.Transport {
+        val writes = mutableListOf<ByteArray>()
+
+        override fun setNotifyOn(service: UUID, characteristic: UUID) = Unit
+        override fun write(service: UUID, characteristic: UUID, payload: ByteArray, withResponse: Boolean) {
+            writes += payload
+        }
+
+        override fun read(service: UUID, characteristic: UUID) = Unit
+        override fun disconnect() = Unit
+        override fun getPeripheral(): BluetoothPeripheral? = null
+        override fun hasCharacteristic(service: UUID, characteristic: UUID) = true
+    }
 }
